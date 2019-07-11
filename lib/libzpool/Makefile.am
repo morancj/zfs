@@ -12,6 +12,8 @@ AM_CFLAGS += $(NO_UNUSED_BUT_SET_VARIABLE)
 # Includes kernel code generate warnings for large stack frames
 AM_CFLAGS += $(FRAME_LARGER_THAN)
 
+AM_CFLAGS += -DLIB_ZPOOL_BUILD
+
 DEFAULT_INCLUDES += \
 	-I$(top_srcdir)/include \
 	-I$(top_srcdir)/lib/libspl/include
@@ -40,12 +42,14 @@ KERNEL_C = \
 	zpool_prop.c \
 	zprop_common.c \
 	abd.c \
+	aggsum.c \
 	arc.c \
 	blkptr.c \
 	bplist.c \
 	bpobj.c \
 	bptree.c \
 	bqueue.c \
+	cityhash.c \
 	dbuf.c \
 	dbuf_stats.c \
 	ddt.c \
@@ -54,6 +58,8 @@ KERNEL_C = \
 	dmu_diff.c \
 	dmu_object.c \
 	dmu_objset.c \
+	dmu_recv.c \
+	dmu_redact.c \
 	dmu_send.c \
 	dmu_traverse.c \
 	dmu_tx.c \
@@ -81,6 +87,7 @@ KERNEL_C = \
 	metaslab.c \
 	mmp.c \
 	multilist.c \
+	objlist.c \
 	pathname.c \
 	range_tree.c \
 	refcount.c \
@@ -90,6 +97,7 @@ KERNEL_C = \
 	skein_zfs.c \
 	spa.c \
 	spa_boot.c \
+	spa_checkpoint.c \
 	spa_config.c \
 	spa_errlog.c \
 	spa_history.c \
@@ -107,6 +115,7 @@ KERNEL_C = \
 	vdev_indirect_births.c \
 	vdev_indirect.c \
 	vdev_indirect_mapping.c \
+	vdev_initialize.c \
 	vdev_label.c \
 	vdev_mirror.c \
 	vdev_missing.c \
@@ -123,6 +132,7 @@ KERNEL_C = \
 	vdev_raidz_math_ssse3.c \
 	vdev_removal.c \
 	vdev_root.c \
+	vdev_trim.c \
 	zap.c \
 	zap_leaf.c \
 	zap_micro.c \
@@ -182,11 +192,10 @@ nodist_libzpool_la_SOURCES = \
 	$(LUA_C)
 
 libzpool_la_LIBADD = \
-	$(top_builddir)/lib/libavl/libavl.la \
 	$(top_builddir)/lib/libicp/libicp.la \
 	$(top_builddir)/lib/libnvpair/libnvpair.la \
-	$(top_builddir)/lib/libspl/libspl.la \
-	$(top_builddir)/lib/libunicode/libunicode.la
+	$(top_builddir)/lib/libunicode/libunicode.la \
+	$(top_builddir)/lib/libzutil/libzutil.la
 
 libzpool_la_LIBADD += $(ZLIB) -ldl
 libzpool_la_LDFLAGS = -pthread -version-info 2:0:0

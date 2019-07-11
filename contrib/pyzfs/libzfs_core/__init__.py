@@ -38,6 +38,7 @@ please visit its `GitHub repository <https://github.com/zfsonlinux/zfs>`_.
 
     Maximum length of any ZFS name.
 '''
+from __future__ import absolute_import, division, print_function
 
 from ._constants import (
     MAXNAMELEN,
@@ -63,6 +64,8 @@ from ._libzfs_core import (
     lzc_get_holds,
     lzc_hold,
     lzc_load_key,
+    lzc_pool_checkpoint,
+    lzc_pool_checkpoint_discard,
     lzc_promote,
     lzc_receive,
     lzc_receive_one,
@@ -116,6 +119,8 @@ __all__ = [
     'lzc_get_holds',
     'lzc_hold',
     'lzc_load_key',
+    'lzc_pool_checkpoint',
+    'lzc_pool_checkpoint_discard',
     'lzc_promote',
     'lzc_receive',
     'lzc_receive_one',

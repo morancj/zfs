@@ -20,13 +20,12 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2015, 2018 by Delphix. All rights reserved.
  */
 
 
 #include <sys/types.h>
 #include <sys/param.h>
-#include <sys/systm.h>
 #include <sys/sysmacros.h>
 #include <sys/cmn_err.h>
 #include <sys/kmem.h>
@@ -45,7 +44,6 @@
 #include <sys/dmu.h>
 #include <sys/spa.h>
 #include <sys/zfs_fuid.h>
-#include <sys/ddi.h>
 #include <sys/dsl_dataset.h>
 
 /*
@@ -530,7 +528,14 @@ zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
 		itx_wr_state_t wr_state = write_state;
 		ssize_t len = resid;
 
-		if (wr_state == WR_COPIED && resid > ZIL_MAX_COPIED_DATA)
+		/*
+		 * A WR_COPIED record must fit entirely in one log block.
+		 * Large writes can use WR_NEED_COPY, which the ZIL will
+		 * split into multiple records across several log blocks
+		 * if necessary.
+		 */
+		if (wr_state == WR_COPIED &&
+		    resid > zil_max_copied_data(zilog))
 			wr_state = WR_NEED_COPY;
 		else if (wr_state == WR_INDIRECT)
 			len = MIN(blocksize - P2PHASE(off, blocksize), resid);
@@ -720,7 +725,7 @@ zfs_log_acl(zilog_t *zilog, dmu_tx_t *tx, znode_t *zp,
 	zil_itx_assign(zilog, itx, tx);
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 module_param(zfs_immediate_write_sz, long, 0644);
 MODULE_PARM_DESC(zfs_immediate_write_sz, "Largest data block to write to zil");
 #endif

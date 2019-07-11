@@ -32,6 +32,8 @@
 #include <linux/blkdev.h>
 #include <linux/elevator.h>
 #include <linux/backing-dev.h>
+#include <linux/hdreg.h>
+#include <linux/msdos_fs.h>	/* for SECTOR_* */
 
 #ifndef HAVE_FMODE_T
 typedef unsigned __bitwise__ fmode_t;
@@ -102,17 +104,6 @@ blk_queue_set_write_cache(struct request_queue *q, bool wc, bool fua)
  */
 #ifndef blk_fs_request
 #define	blk_fs_request(rq)	((rq)->cmd_type == REQ_TYPE_FS)
-#endif
-
-/*
- * 2.6.27 API change,
- * The blk_queue_stackable() queue flag was added in 2.6.27 to handle dm
- * stacking drivers.  Prior to this request stacking drivers were detected
- * by checking (q->request_fn == NULL), for earlier kernels we revert to
- * this legacy behavior.
- */
-#ifndef blk_queue_stackable
-#define	blk_queue_stackable(q)	((q)->request_fn == NULL)
 #endif
 
 /*
@@ -374,6 +365,20 @@ bio_set_bi_error(struct bio *bio, int error)
 #endif /* HAVE_BLKDEV_GET_BY_PATH | HAVE_OPEN_BDEV_EXCLUSIVE */
 
 /*
+ * 4.1 - x.y.z API,
+ * 3.10.0 CentOS 7.x API,
+ *   blkdev_reread_part()
+ *
+ * For older kernels trigger a re-reading of the partition table by calling
+ * check_disk_change() which calls flush_disk() to invalidate the device.
+ */
+#ifdef HAVE_BLKDEV_REREAD_PART
+#define	vdev_bdev_reread_part(bdev)	blkdev_reread_part(bdev)
+#else
+#define	vdev_bdev_reread_part(bdev)	check_disk_change(bdev)
+#endif /* HAVE_BLKDEV_REREAD_PART */
+
+/*
  * 2.6.22 API change
  * The function invalidate_bdev() lost it's second argument because
  * it was unused.
@@ -602,6 +607,36 @@ blk_queue_discard_granularity(struct request_queue *q, unsigned int dg)
 #else
 #define	blk_queue_discard_granularity(x, dg)	((void)0)
 #endif /* HAVE_DISCARD_GRANULARITY */
+
+/*
+ * 2.6.32 - 4.x API,
+ *   blk_queue_discard()
+ */
+#if !defined(HAVE_BLK_QUEUE_DISCARD)
+#define	blk_queue_discard(q)			(0);
+#endif
+
+/*
+ * 4.8 - 4.x API,
+ *   blk_queue_secure_erase()
+ *
+ * 2.6.36 - 4.7 API,
+ *   blk_queue_secdiscard()
+ *
+ * 2.6.x - 2.6.35 API,
+ *   Unsupported by kernel
+ */
+static inline int
+blk_queue_discard_secure(struct request_queue *q)
+{
+#if defined(HAVE_BLK_QUEUE_SECURE_ERASE)
+	return (blk_queue_secure_erase(q));
+#elif defined(HAVE_BLK_QUEUE_SECDISCARD)
+	return (blk_queue_secdiscard(q));
+#else
+	return (0);
+#endif
+}
 
 /*
  * Default Linux IO Scheduler,

@@ -22,7 +22,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
- * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
  * Copyright 2017 Joyent, Inc.
  */
 
@@ -93,8 +93,7 @@ spa_config_load(void)
 	 */
 	pathname = kmem_alloc(MAXPATHLEN, KM_SLEEP);
 
-	(void) snprintf(pathname, MAXPATHLEN, "%s%s",
-	    (rootdir != NULL) ? "./" : "", spa_config_path);
+	(void) snprintf(pathname, MAXPATHLEN, "%s", spa_config_path);
 
 	file = kobj_open_file(pathname);
 
@@ -393,7 +392,8 @@ void
 spa_config_set(spa_t *spa, nvlist_t *config)
 {
 	mutex_enter(&spa->spa_props_lock);
-	nvlist_free(spa->spa_config);
+	if (spa->spa_config != NULL && spa->spa_config != config)
+		nvlist_free(spa->spa_config);
 	spa->spa_config = config;
 	mutex_exit(&spa->spa_props_lock);
 }
@@ -575,6 +575,18 @@ spa_config_update(spa_t *spa, int what)
 		 */
 		for (c = 0; c < rvd->vdev_children; c++) {
 			vdev_t *tvd = rvd->vdev_child[c];
+
+			/*
+			 * Explicitly skip vdevs that are indirect or
+			 * log vdevs that are being removed. The reason
+			 * is that both of those can have vdev_ms_array
+			 * set to 0 and we wouldn't want to change their
+			 * metaslab size nor call vdev_expand() on them.
+			 */
+			if (!vdev_is_concrete(tvd) ||
+			    (tvd->vdev_islog && tvd->vdev_removing))
+				continue;
+
 			if (tvd->vdev_ms_array == 0)
 				vdev_metaslab_set_size(tvd);
 			vdev_expand(tvd, txg);
@@ -599,7 +611,7 @@ spa_config_update(spa_t *spa, int what)
 		spa_config_update(spa, SPA_CONFIG_UPDATE_VDEVS);
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(spa_config_load);
 EXPORT_SYMBOL(spa_all_configs);
 EXPORT_SYMBOL(spa_config_set);

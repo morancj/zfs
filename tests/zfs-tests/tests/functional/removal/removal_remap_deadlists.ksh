@@ -15,7 +15,7 @@
 #
 
 #
-# Copyright (c) 2015, 2016 by Delphix. All rights reserved.
+# Copyright (c) 2015, 2017 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -34,16 +34,22 @@ log_must zfs snapshot $TESTPOOL/$TESTFS@snap-pre2
 log_must dd if=/dev/zero of=$TESTDIR/file bs=1024k count=100 \
     conv=notrunc seek=200
 
-log_must zpool remove $TESTPOOL $REMOVEDISK
 if is_linux; then
-	log_must wait_for_removal $TESTPOOL
+	log_must attempt_during_removal $TESTPOOL $REMOVEDISK zdb -cd $TESTPOOL
 else
-	log_must wait_for_removal $TESTPOOL zdb -cd $TESTPOOL
+	log_must attempt_during_removal $TESTPOOL $REMOVEDISK
 fi
 log_mustnot vdevs_in_pool $TESTPOOL $REMOVEDISK
 log_must zdb -cd $TESTPOOL
 
-log_must zfs remap $TESTPOOL/$TESTFS
+#
+# Touch one block under each L1 indirect block, so that the other data blocks
+# will be remapped to their concrete locations.  These parameters assume
+# recordsize=128K, indirect block size of 128K (1024 block pointers per
+# indirect block), and file size of less than 3*1024 blocks (384MB).
+#
+log_must stride_dd -i /dev/urandom -o $TESTDIR/file -b 131072 -c 3 -s 1024
+
 log_must zdb -cd $TESTPOOL
 
 log_must zfs snapshot $TESTPOOL/$TESTFS@snap-post3

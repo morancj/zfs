@@ -8,15 +8,18 @@ dist_pkgdata_SCRIPTS = \
 	$(top_srcdir)/scripts/zfs-helpers.sh
 
 EXTRA_DIST = \
-	common.sh.in \
 	commitcheck.sh \
+	common.sh.in \
+	cstyle.pl \
 	dkms.mkconf \
 	dkms.postbuild \
 	enum-extract.pl \
 	kmodtool \
+	make_gitrev.sh \
+	man-dates.sh \
 	paxcheck.sh \
 	zfs2zol-patch.sed \
-	cstyle.pl
+	zol2zfs-patch.sed
 
 define EXTRA_ENVIRONMENT
 
@@ -40,8 +43,7 @@ export INSTALL_MOUNT_HELPER_DIR=@mounthelperdir@
 export INSTALL_SYSCONF_DIR=@sysconfdir@
 export INSTALL_PYTHON_DIR=@pythonsitedir@
 
-export KMOD_SPL=@SPL_OBJ@/module/spl/spl.ko
-export KMOD_SPLAT=@SPL_OBJ@/module/splat/splat.ko
+export KMOD_SPL=@abs_top_builddir@/module/spl/spl.ko
 export KMOD_ZAVL=@abs_top_builddir@/module/avl/zavl.ko
 export KMOD_ZNVPAIR=@abs_top_builddir@/module/nvpair/znvpair.ko
 export KMOD_ZUNICODE=@abs_top_builddir@/module/unicode/zunicode.ko
@@ -58,7 +60,7 @@ all-local:
 		-e '\|^export SBIN_DIR=|s|$$|@abs_top_builddir@/bin|' \
 		-e '\|^export ZTS_DIR=|s|$$|@abs_top_srcdir@/tests|' \
 		-e '\|^export SCRIPT_DIR=|s|$$|@abs_top_srcdir@/scripts|' \
-		common.sh.in >common.sh
+		$(abs_top_srcdir)/scripts/common.sh.in >common.sh
 	-echo "$$EXTRA_ENVIRONMENT" >>common.sh
 
 clean-local:
@@ -69,4 +71,5 @@ install-data-hook:
 		-e '\|^export SBIN_DIR=|s|$$|@sbindir@|' \
 		-e '\|^export ZTS_DIR=|s|$$|@datadir@/@PACKAGE@|' \
 		-e '\|^export SCRIPT_DIR=|s|$$|@datadir@/@PACKAGE@|' \
-		common.sh.in >$(DESTDIR)$(datadir)/@PACKAGE@/common.sh
+		$(abs_top_srcdir)/scripts/common.sh.in \
+		>$(DESTDIR)$(datadir)/@PACKAGE@/common.sh

@@ -14,7 +14,7 @@
  */
 
 /*
- * Copyright (c) 2016, 2017 by Delphix. All rights reserved.
+ * Copyright (c) 2016, 2018 by Delphix. All rights reserved.
  */
 
 #ifndef _SYS_ZCP_H
@@ -33,8 +33,8 @@ extern "C" {
 
 #define	ZCP_RUN_INFO_KEY "runinfo"
 
-extern uint64_t zfs_lua_max_instrlimit;
-extern uint64_t zfs_lua_max_memlimit;
+extern unsigned long zfs_lua_max_instrlimit;
+extern unsigned long zfs_lua_max_memlimit;
 
 int zcp_argerror(lua_State *, int, const char *, ...);
 
@@ -51,6 +51,12 @@ typedef struct zcp_cleanup_handler {
 	void *zch_cleanup_arg;
 	list_node_t zch_node;
 } zcp_cleanup_handler_t;
+
+typedef struct zcp_alloc_arg {
+	boolean_t	aa_must_succeed;
+	int64_t		aa_alloc_remaining;
+	int64_t		aa_alloc_limit;
+} zcp_alloc_arg_t;
 
 typedef struct zcp_run_info {
 	dsl_pool_t	*zri_pool;
@@ -94,6 +100,11 @@ typedef struct zcp_run_info {
 	boolean_t	zri_timed_out;
 
 	/*
+	 * Channel program was canceled by user
+	 */
+	boolean_t	zri_canceled;
+
+	/*
 	 * Boolean indicating whether or not we are running in syncing
 	 * context.
 	 */
@@ -104,6 +115,26 @@ typedef struct zcp_run_info {
 	 * triggered in the event of a fatal error.
 	 */
 	list_t		zri_cleanup_handlers;
+
+	/*
+	 * The Lua state context of our channel program.
+	 */
+	lua_State	*zri_state;
+
+	/*
+	 * Lua memory allocator arguments.
+	 */
+	zcp_alloc_arg_t	*zri_allocargs;
+
+	/*
+	 * Contains output values from zcp script or error string.
+	 */
+	nvlist_t	*zri_outnvl;
+
+	/*
+	 * The errno number returned to caller of zcp_eval().
+	 */
+	int		zri_result;
 } zcp_run_info_t;
 
 zcp_run_info_t *zcp_run_info(lua_State *);

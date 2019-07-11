@@ -472,7 +472,7 @@ vdev_raidz_math_init(void)
 	return;
 #endif
 
-	/* Fake an zio and run the benchmark on a warmed up buffer */
+	/* Fake a zio and run the benchmark on a warmed up buffer */
 	bench_zio = kmem_zalloc(sizeof (zio_t), KM_SLEEP);
 	bench_zio->io_offset = 0;
 	bench_zio->io_size = BENCH_ZIO_SIZE; /* only data columns */
@@ -614,7 +614,7 @@ vdev_raidz_impl_set(const char *val)
 	return (err);
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 #include <linux/mod_compat.h>
 
 static int

@@ -667,7 +667,8 @@ zfs_crypto_get_encryption_root(zfs_handle_t *zhp, boolean_t *is_encroot,
 
 int
 zfs_crypto_create(libzfs_handle_t *hdl, char *parent_name, nvlist_t *props,
-    nvlist_t *pool_props, uint8_t **wkeydata_out, uint_t *wkeylen_out)
+    nvlist_t *pool_props, boolean_t stdin_available, uint8_t **wkeydata_out,
+    uint_t *wkeylen_out)
 {
 	int ret;
 	char errbuf[1024];
@@ -739,14 +740,6 @@ zfs_crypto_create(libzfs_handle_t *hdl, char *parent_name, nvlist_t *props,
 		pcrypt = ZIO_CRYPT_OFF;
 	}
 
-	/* Check for encryption being explicitly truned off */
-	if (crypt == ZIO_CRYPT_OFF && pcrypt != ZIO_CRYPT_OFF) {
-		ret = EINVAL;
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "Invalid encryption value. Dataset must be encrypted."));
-		goto out;
-	}
-
 	/* Get the inherited encryption property if we don't have it locally */
 	if (!local_crypt)
 		crypt = pcrypt;
@@ -808,6 +801,17 @@ zfs_crypto_create(libzfs_handle_t *hdl, char *parent_name, nvlist_t *props,
 	 * encryption root. Populate the encryption params.
 	 */
 	if (keylocation != NULL) {
+		/*
+		 * 'zfs recv -o keylocation=prompt' won't work because stdin
+		 * is being used by the send stream, so we disallow it.
+		 */
+		if (!stdin_available && strcmp(keylocation, "prompt") == 0) {
+			ret = EINVAL;
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN, "Cannot use "
+			    "'prompt' keylocation because stdin is in use."));
+			goto out;
+		}
+
 		ret = populate_create_encryption_params_nvlists(hdl, NULL,
 		    B_FALSE, keyformat, keylocation, props, &wkeydata,
 		    &wkeylen);
@@ -837,10 +841,7 @@ int
 zfs_crypto_clone_check(libzfs_handle_t *hdl, zfs_handle_t *origin_zhp,
     char *parent_name, nvlist_t *props)
 {
-	int ret;
 	char errbuf[1024];
-	zfs_handle_t *pzhp = NULL;
-	uint64_t pcrypt, ocrypt;
 
 	(void) snprintf(errbuf, sizeof (errbuf),
 	    dgettext(TEXT_DOMAIN, "Encryption clone error"));
@@ -853,40 +854,12 @@ zfs_crypto_clone_check(libzfs_handle_t *hdl, zfs_handle_t *origin_zhp,
 	    nvlist_exists(props, zfs_prop_to_name(ZFS_PROP_KEYLOCATION)) ||
 	    nvlist_exists(props, zfs_prop_to_name(ZFS_PROP_ENCRYPTION)) ||
 	    nvlist_exists(props, zfs_prop_to_name(ZFS_PROP_PBKDF2_ITERS))) {
-		ret = EINVAL;
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 		    "Encryption properties must inherit from origin dataset."));
-		goto out;
+		return (EINVAL);
 	}
 
-	/* get a reference to parent dataset, should never be NULL */
-	pzhp = make_dataset_handle(hdl, parent_name);
-	if (pzhp == NULL) {
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "Failed to lookup parent."));
-		return (ENOENT);
-	}
-
-	/* Lookup parent's crypt */
-	pcrypt = zfs_prop_get_int(pzhp, ZFS_PROP_ENCRYPTION);
-	ocrypt = zfs_prop_get_int(origin_zhp, ZFS_PROP_ENCRYPTION);
-
-	/* all children of encrypted parents must be encrypted */
-	if (pcrypt != ZIO_CRYPT_OFF && ocrypt == ZIO_CRYPT_OFF) {
-		ret = EINVAL;
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "Cannot create unencrypted clone as a child "
-		    "of encrypted parent."));
-		goto out;
-	}
-
-	zfs_close(pzhp);
 	return (0);
-
-out:
-	if (pzhp != NULL)
-		zfs_close(pzhp);
-	return (ret);
 }
 
 typedef struct loadkeys_cbdata {

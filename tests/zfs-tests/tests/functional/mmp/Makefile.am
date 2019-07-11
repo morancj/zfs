@@ -10,6 +10,8 @@ dist_pkgdata_SCRIPTS = \
 	mmp_exported_import.ksh \
 	mmp_write_uberblocks.ksh \
 	mmp_reset_interval.ksh \
+	mmp_on_zdb.ksh \
+	mmp_write_distribution.ksh \
 	setup.ksh \
 	cleanup.ksh
 

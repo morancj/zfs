@@ -14,7 +14,7 @@
  */
 
 /*
- * Copyright (c) 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2015, 2017 by Delphix. All rights reserved.
  */
 
 #include <sys/dmu_tx.h>
@@ -282,7 +282,6 @@ vdev_indirect_mapping_entry_for_offset_or_next(vdev_indirect_mapping_t *vim,
 	    B_TRUE));
 }
 
-
 void
 vdev_indirect_mapping_close(vdev_indirect_mapping_t *vim)
 {
@@ -539,14 +538,13 @@ typedef struct load_obsolete_space_map_arg {
 } load_obsolete_space_map_arg_t;
 
 static int
-load_obsolete_sm_callback(maptype_t type, uint64_t offset, uint64_t size,
-    void *arg)
+load_obsolete_sm_callback(space_map_entry_t *sme, void *arg)
 {
 	load_obsolete_space_map_arg_t *losma = arg;
-	ASSERT3S(type, ==, SM_ALLOC);
+	ASSERT3S(sme->sme_type, ==, SM_ALLOC);
 
 	vdev_indirect_mapping_increment_obsolete_count(losma->losma_vim,
-	    offset, size, losma->losma_counts);
+	    sme->sme_offset, sme->sme_run, losma->losma_counts);
 
 	return (0);
 }
@@ -562,6 +560,7 @@ vdev_indirect_mapping_load_obsolete_spacemap(vdev_indirect_mapping_t *vim,
 	losma.losma_counts = counts;
 	losma.losma_vim = vim;
 	VERIFY0(space_map_iterate(obsolete_space_sm,
+	    space_map_length(obsolete_space_sm),
 	    load_obsolete_sm_callback, &losma));
 }
 
@@ -596,7 +595,7 @@ vdev_indirect_mapping_free_obsolete_counts(vdev_indirect_mapping_t *vim,
 	vmem_free(counts, vim->vim_phys->vimp_num_entries * sizeof (uint32_t));
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(vdev_indirect_mapping_add_entries);
 EXPORT_SYMBOL(vdev_indirect_mapping_alloc);
 EXPORT_SYMBOL(vdev_indirect_mapping_bytes_mapped);

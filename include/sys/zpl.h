@@ -31,7 +31,6 @@
 #include <linux/dcache_compat.h>
 #include <linux/exportfs.h>
 #include <linux/falloc.h>
-#include <linux/file_compat.h>
 #include <linux/parser.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/vfs_compat.h>
@@ -188,5 +187,14 @@ zpl_dir_emit_dots(struct file *file, zpl_dir_context_t *ctx)
 	return (true);
 }
 #endif /* HAVE_VFS_ITERATE */
+
+/*
+ * Linux 4.18, inode times converted from timespec to timespec64.
+ */
+#if defined(HAVE_INODE_TIMESPEC64_TIMES)
+#define	zpl_inode_timespec_trunc(ts, gran)	timespec64_trunc(ts, gran)
+#else
+#define	zpl_inode_timespec_trunc(ts, gran)	timespec_trunc(ts, gran)
+#endif
 
 #endif	/* _SYS_ZPL_H */

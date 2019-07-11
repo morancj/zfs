@@ -21,7 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
  */
 
@@ -32,31 +32,25 @@
 
 #include <sys/note.h>
 #include <sys/types.h>
-#include <sys/t_lock.h>
 #include <sys/atomic.h>
 #include <sys/sysmacros.h>
-#include <sys/bitmap.h>
+#include <sys/vmsystm.h>
+#include <sys/condvar.h>
 #include <sys/cmn_err.h>
 #include <sys/kmem.h>
 #include <sys/kmem_cache.h>
 #include <sys/vmem.h>
 #include <sys/taskq.h>
-#include <sys/buf.h>
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/cpuvar.h>
 #include <sys/kobj.h>
-#include <sys/conf.h>
 #include <sys/disp.h>
 #include <sys/debug.h>
 #include <sys/random.h>
+#include <sys/strings.h>
 #include <sys/byteorder.h>
-#include <sys/systm.h>
 #include <sys/list.h>
 #include <sys/uio_impl.h>
-#include <sys/dirent.h>
 #include <sys/time.h>
-#include <vm/seg_kmem.h>
 #include <sys/zone.h>
 #include <sys/sdt.h>
 #include <sys/kstat.h>
@@ -68,6 +62,7 @@
 #include <sys/ctype.h>
 #include <sys/disp.h>
 #include <sys/trace.h>
+#include <sys/procfs_list.h>
 #include <linux/dcache_compat.h>
 #include <linux/utsname_compat.h>
 
@@ -76,8 +71,6 @@
 #define	_SYS_MUTEX_H
 #define	_SYS_RWLOCK_H
 #define	_SYS_CONDVAR_H
-#define	_SYS_SYSTM_H
-#define	_SYS_T_LOCK_H
 #define	_SYS_VNODE_H
 #define	_SYS_VFS_H
 #define	_SYS_SUNDDI_H
@@ -94,7 +87,6 @@
 #include <strings.h>
 #include <pthread.h>
 #include <setjmp.h>
-#include <synch.h>
 #include <assert.h>
 #include <alloca.h>
 #include <umem.h>
@@ -130,6 +122,7 @@
 
 #define	noinline	__attribute__((noinline))
 #define	likely(x)	__builtin_expect((x), 1)
+#define	unlikely(x)	__builtin_expect((x), 0)
 
 /*
  * Debugging
@@ -244,6 +237,7 @@ extern kthread_t *zk_thread_create(void (*func)(void *), void *arg,
 
 #define	kpreempt_disable()	((void)0)
 #define	kpreempt_enable()	((void)0)
+#define	cond_resched()		sched_yield()
 
 /*
  * Mutexes
@@ -312,6 +306,7 @@ typedef pthread_cond_t		kcondvar_t;
 extern void cv_init(kcondvar_t *cv, char *name, int type, void *arg);
 extern void cv_destroy(kcondvar_t *cv);
 extern void cv_wait(kcondvar_t *cv, kmutex_t *mp);
+extern int cv_wait_sig(kcondvar_t *cv, kmutex_t *mp);
 extern clock_t cv_timedwait(kcondvar_t *cv, kmutex_t *mp, clock_t abstime);
 extern clock_t cv_timedwait_hires(kcondvar_t *cvp, kmutex_t *mp, hrtime_t tim,
     hrtime_t res, int flag);
@@ -320,8 +315,8 @@ extern void cv_broadcast(kcondvar_t *cv);
 
 #define	cv_timedwait_io(cv, mp, at)		cv_timedwait(cv, mp, at)
 #define	cv_timedwait_sig(cv, mp, at)		cv_timedwait(cv, mp, at)
-#define	cv_wait_sig(cv, mp)			cv_wait(cv, mp)
 #define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
+#define	cv_wait_io_sig(cv, mp)			cv_wait_sig(cv, mp)
 #define	cv_timedwait_sig_hires(cv, mp, t, r, f) \
 	cv_timedwait_hires(cv, mp, t, r, f)
 
@@ -359,6 +354,38 @@ extern void kstat_set_raw_ops(kstat_t *ksp,
     int (*headers)(char *buf, size_t size),
     int (*data)(char *buf, size_t size, void *data),
     void *(*addr)(kstat_t *ksp, loff_t index));
+
+/*
+ * procfs list manipulation
+ */
+
+struct seq_file { };
+void seq_printf(struct seq_file *m, const char *fmt, ...);
+
+typedef struct procfs_list {
+	void		*pl_private;
+	kmutex_t	pl_lock;
+	list_t		pl_list;
+	uint64_t	pl_next_id;
+	size_t		pl_node_offset;
+} procfs_list_t;
+
+typedef struct procfs_list_node {
+	list_node_t	pln_link;
+	uint64_t	pln_id;
+} procfs_list_node_t;
+
+void procfs_list_install(const char *module,
+    const char *name,
+    mode_t mode,
+    procfs_list_t *procfs_list,
+    int (*show)(struct seq_file *f, void *p),
+    int (*show_header)(struct seq_file *f),
+    int (*clear)(procfs_list_t *procfs_list),
+    size_t procfs_list_node_off);
+void procfs_list_uninstall(procfs_list_t *procfs_list);
+void procfs_list_destroy(procfs_list_t *procfs_list);
+void procfs_list_add(procfs_list_t *procfs_list, void *p);
 
 /*
  * Kernel memory
@@ -492,7 +519,7 @@ extern char *vn_dumpdir;
 #define	AV_SCANSTAMP_SZ	32		/* length of anti-virus scanstamp */
 
 typedef struct xoptattr {
-	timestruc_t	xoa_createtime;	/* Create time of file */
+	inode_timespec_t xoa_createtime;	/* Create time of file */
 	uint8_t		xoa_archive;
 	uint8_t		xoa_system;
 	uint8_t		xoa_readonly;
@@ -555,6 +582,8 @@ typedef struct vsecattr {
 
 #define	CRCREAT		0
 
+#define	F_FREESP	11
+
 extern int fop_getattr(vnode_t *vp, vattr_t *vap);
 
 #define	VOP_CLOSE(vp, f, c, o, cr, ct)	vn_close(vp)
@@ -562,6 +591,16 @@ extern int fop_getattr(vnode_t *vp, vattr_t *vap);
 #define	VOP_GETATTR(vp, vap, fl, cr, ct)  fop_getattr((vp), (vap));
 
 #define	VOP_FSYNC(vp, f, cr, ct)	fsync((vp)->v_fd)
+
+#if defined(HAVE_FILE_FALLOCATE) && \
+	defined(FALLOC_FL_PUNCH_HOLE) && \
+	defined(FALLOC_FL_KEEP_SIZE)
+#define	VOP_SPACE(vp, cmd, flck, fl, off, cr, ct) \
+	fallocate((vp)->v_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, \
+	    (flck)->l_start, (flck)->l_len)
+#else
+#define	VOP_SPACE(vp, cmd, flck, fl, off, cr, ct) (0)
+#endif
 
 #define	VN_RELE(vp)	vn_close(vp)
 
@@ -605,13 +644,6 @@ extern void delay(clock_t ticks);
 #define	USEC_TO_TICK(usec)	((usec) / (MICROSEC / hz))
 #define	NSEC_TO_TICK(usec)	((usec) / (NANOSEC / hz))
 
-#define	gethrestime_sec() time(NULL)
-#define	gethrestime(t) \
-	do {\
-		(t)->tv_sec = gethrestime_sec();\
-		(t)->tv_nsec = 0;\
-	} while (0);
-
 #define	max_ncpus	64
 #define	boot_ncpus	(sysconf(_SC_NPROCESSORS_ONLN))
 
@@ -647,7 +679,6 @@ extern void random_init(void);
 extern void random_fini(void);
 
 struct spa;
-extern void nicenum(uint64_t num, char *buf, size_t);
 extern void show_pool_stats(struct spa *);
 extern int set_global_var(char *arg);
 
@@ -674,6 +705,7 @@ typedef struct callb_cpr {
 
 #define	zone_dataset_visible(x, y)	(1)
 #define	INGLOBALZONE(z)			(1)
+extern uint32_t zone_get_hostid(void *zonep);
 
 extern char *kmem_vasprintf(const char *fmt, va_list adx);
 extern char *kmem_asprintf(const char *fmt, ...);
@@ -757,6 +789,9 @@ typedef int fstrans_cookie_t;
 extern fstrans_cookie_t spl_fstrans_mark(void);
 extern void spl_fstrans_unmark(fstrans_cookie_t);
 extern int __spl_pf_fstrans_check(void);
+extern int kmem_cache_reap_active(void);
+
+#define	____cacheline_aligned
 
 #endif /* _KERNEL */
 #endif	/* _SYS_ZFS_CONTEXT_H */

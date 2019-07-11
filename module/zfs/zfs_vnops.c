@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2015 by Chunwei Chen. All rights reserved.
  * Copyright 2017 Nexenta Systems, Inc.
  */
@@ -33,11 +33,8 @@
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/time.h>
-#include <sys/systm.h>
 #include <sys/sysmacros.h>
-#include <sys/resource.h>
 #include <sys/vfs.h>
-#include <sys/vfs_opreg.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/kmem.h>
@@ -45,11 +42,9 @@
 #include <sys/uio.h>
 #include <sys/vmsystm.h>
 #include <sys/atomic.h>
-#include <vm/pvn.h>
 #include <sys/pathname.h>
 #include <sys/cmn_err.h>
 #include <sys/errno.h>
-#include <sys/unistd.h>
 #include <sys/zfs_dir.h>
 #include <sys/zfs_acl.h>
 #include <sys/zfs_ioctl.h>
@@ -61,22 +56,16 @@
 #include <sys/dbuf.h>
 #include <sys/zap.h>
 #include <sys/sa.h>
-#include <sys/dirent.h>
 #include <sys/policy.h>
 #include <sys/sunddi.h>
 #include <sys/sid.h>
 #include <sys/mode.h>
-#include "fs/fs_subr.h"
 #include <sys/zfs_ctldir.h>
 #include <sys/zfs_fuid.h>
 #include <sys/zfs_sa.h>
 #include <sys/zfs_vnops.h>
-#include <sys/dnlc.h>
 #include <sys/zfs_rlock.h>
-#include <sys/extdirent.h>
-#include <sys/kidmap.h>
 #include <sys/cred.h>
-#include <sys/attr.h>
 #include <sys/zpl.h>
 #include <sys/zil.h>
 #include <sys/sa_impl.h>
@@ -449,15 +438,11 @@ unsigned long zfs_delete_blocks = DMU_MAX_DELETEBLKCNT;
 int
 zfs_read(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 {
-	znode_t		*zp = ITOZ(ip);
-	zfsvfs_t	*zfsvfs = ITOZSB(ip);
-	ssize_t		n, nbytes;
-	int		error = 0;
-	rl_t		*rl;
-#ifdef HAVE_UIO_ZEROCOPY
-	xuio_t		*xuio = NULL;
-#endif /* HAVE_UIO_ZEROCOPY */
+	int error = 0;
+	boolean_t frsync = B_FALSE;
 
+	znode_t *zp = ITOZ(ip);
+	zfsvfs_t *zfsvfs = ITOZSB(ip);
 	ZFS_ENTER(zfsvfs);
 	ZFS_VERIFY_ZP(zp);
 
@@ -482,19 +467,26 @@ zfs_read(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		return (0);
 	}
 
+#ifdef FRSYNC
 	/*
 	 * If we're in FRSYNC mode, sync out this znode before reading it.
 	 * Only do this for non-snapshots.
+	 *
+	 * Some platforms do not support FRSYNC and instead map it
+	 * to FSYNC, which results in unnecessary calls to zil_commit. We
+	 * only honor FRSYNC requests on platforms which support it.
 	 */
+	frsync = !!(ioflag & FRSYNC);
+#endif
 	if (zfsvfs->z_log &&
-	    (ioflag & FRSYNC || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS))
+	    (frsync || zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS))
 		zil_commit(zfsvfs->z_log, zp->z_id);
 
 	/*
 	 * Lock the range against changes.
 	 */
-	rl = zfs_range_lock(&zp->z_range_lock, uio->uio_loffset, uio->uio_resid,
-	    RL_READER);
+	locked_range_t *lr = rangelock_enter(&zp->z_rangelock,
+	    uio->uio_loffset, uio->uio_resid, RL_READER);
 
 	/*
 	 * If we are reading past end-of-file we can skip
@@ -506,9 +498,11 @@ zfs_read(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 	}
 
 	ASSERT(uio->uio_loffset < zp->z_size);
-	n = MIN(uio->uio_resid, zp->z_size - uio->uio_loffset);
+	ssize_t n = MIN(uio->uio_resid, zp->z_size - uio->uio_loffset);
+	ssize_t start_resid = n;
 
 #ifdef HAVE_UIO_ZEROCOPY
+	xuio_t *xuio = NULL;
 	if ((uio->uio_extflg == UIO_XUIO) &&
 	    (((xuio_t *)uio)->xu_type == UIOTYPE_ZEROCOPY)) {
 		int nblk;
@@ -540,7 +534,7 @@ zfs_read(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 #endif /* HAVE_UIO_ZEROCOPY */
 
 	while (n > 0) {
-		nbytes = MIN(n, zfs_read_chunk_size -
+		ssize_t nbytes = MIN(n, zfs_read_chunk_size -
 		    P2PHASE(uio->uio_loffset, zfs_read_chunk_size));
 
 		if (zp->z_is_mapped && !(ioflag & O_DIRECT)) {
@@ -559,8 +553,12 @@ zfs_read(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 
 		n -= nbytes;
 	}
+
+	int64_t nread = start_resid - n;
+	dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, nread);
+	task_io_account_read(nread);
 out:
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	ZFS_EXIT(zfsvfs);
 	return (error);
@@ -589,46 +587,28 @@ out:
 int
 zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 {
-	znode_t		*zp = ITOZ(ip);
-	rlim64_t	limit = uio->uio_limit;
-	ssize_t		start_resid = uio->uio_resid;
-	ssize_t		tx_bytes;
-	uint64_t	end_size;
-	dmu_tx_t	*tx;
-	zfsvfs_t	*zfsvfs = ZTOZSB(zp);
-	zilog_t		*zilog;
-	offset_t	woff;
-	ssize_t		n, nbytes;
-	rl_t		*rl;
-	int		max_blksz = zfsvfs->z_max_blksz;
-	int		error = 0;
-	arc_buf_t	*abuf;
-	const iovec_t	*aiov = NULL;
-	xuio_t		*xuio = NULL;
-	int		write_eof;
-	int		count = 0;
-	sa_bulk_attr_t	bulk[4];
-	uint64_t	mtime[2], ctime[2];
-	uint32_t	uid;
-#ifdef HAVE_UIO_ZEROCOPY
-	int		i_iov = 0;
-	const iovec_t	*iovp = uio->uio_iov;
-	ASSERTV(int	iovcnt = uio->uio_iovcnt);
-#endif
+	int error = 0;
+	ssize_t start_resid = uio->uio_resid;
 
 	/*
 	 * Fasttrack empty write
 	 */
-	n = start_resid;
+	ssize_t n = start_resid;
 	if (n == 0)
 		return (0);
 
+	rlim64_t limit = uio->uio_limit;
 	if (limit == RLIM64_INFINITY || limit > MAXOFFSET_T)
 		limit = MAXOFFSET_T;
 
+	znode_t *zp = ITOZ(ip);
+	zfsvfs_t *zfsvfs = ZTOZSB(zp);
 	ZFS_ENTER(zfsvfs);
 	ZFS_VERIFY_ZP(zp);
 
+	sa_bulk_attr_t bulk[4];
+	int count = 0;
+	uint64_t mtime[2], ctime[2];
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL, &mtime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL, &ctime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_SIZE(zfsvfs), NULL,
@@ -655,16 +635,17 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		return (SET_ERROR(EPERM));
 	}
 
-	zilog = zfsvfs->z_log;
-
 	/*
 	 * Validate file offset
 	 */
-	woff = ioflag & FAPPEND ? zp->z_size : uio->uio_loffset;
+	offset_t woff = ioflag & FAPPEND ? zp->z_size : uio->uio_loffset;
 	if (woff < 0) {
 		ZFS_EXIT(zfsvfs);
 		return (SET_ERROR(EINVAL));
 	}
+
+	int max_blksz = zfsvfs->z_max_blksz;
+	xuio_t *xuio = NULL;
 
 	/*
 	 * Pre-fault the pages to ensure slow (eg NFS) pages
@@ -677,19 +658,23 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		xuio = (xuio_t *)uio;
 	else
 #endif
-		uio_prefaultpages(MIN(n, max_blksz), uio);
+		if (uio_prefaultpages(MIN(n, max_blksz), uio)) {
+			ZFS_EXIT(zfsvfs);
+			return (SET_ERROR(EFAULT));
+		}
 
 	/*
 	 * If in append mode, set the io offset pointer to eof.
 	 */
+	locked_range_t *lr;
 	if (ioflag & FAPPEND) {
 		/*
 		 * Obtain an appending range lock to guarantee file append
 		 * semantics.  We reset the write offset once we have the lock.
 		 */
-		rl = zfs_range_lock(&zp->z_range_lock, 0, n, RL_APPEND);
-		woff = rl->r_off;
-		if (rl->r_len == UINT64_MAX) {
+		lr = rangelock_enter(&zp->z_rangelock, 0, n, RL_APPEND);
+		woff = lr->lr_offset;
+		if (lr->lr_length == UINT64_MAX) {
 			/*
 			 * We overlocked the file because this write will cause
 			 * the file block size to increase.
@@ -704,11 +689,11 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		 * this write, then this range lock will lock the entire file
 		 * so that we can re-write the block safely.
 		 */
-		rl = zfs_range_lock(&zp->z_range_lock, woff, n, RL_WRITER);
+		lr = rangelock_enter(&zp->z_rangelock, woff, n, RL_WRITER);
 	}
 
 	if (woff >= limit) {
-		zfs_range_unlock(rl);
+		rangelock_exit(lr);
 		ZFS_EXIT(zfsvfs);
 		return (SET_ERROR(EFBIG));
 	}
@@ -717,9 +702,16 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		n = limit - woff;
 
 	/* Will this write extend the file length? */
-	write_eof = (woff + n > zp->z_size);
+	int write_eof = (woff + n > zp->z_size);
 
-	end_size = MAX(zp->z_size, woff + n);
+	uint64_t end_size = MAX(zp->z_size, woff + n);
+	zilog_t *zilog = zfsvfs->z_log;
+#ifdef HAVE_UIO_ZEROCOPY
+	int		i_iov = 0;
+	const iovec_t	*iovp = uio->uio_iov;
+	ASSERTV(int	iovcnt = uio->uio_iovcnt);
+#endif
+
 
 	/*
 	 * Write the file in reasonable size chunks.  Each chunk is written
@@ -727,8 +719,8 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 	 * and allows us to do more fine-grained space accounting.
 	 */
 	while (n > 0) {
-		abuf = NULL;
 		woff = uio->uio_loffset;
+
 		if (zfs_id_overblockquota(zfsvfs, DMU_USERUSED_OBJECT,
 		    KUID_TO_SUID(ip->i_uid)) ||
 		    zfs_id_overblockquota(zfsvfs, DMU_GROUPUSED_OBJECT,
@@ -736,13 +728,13 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		    (zp->z_projid != ZFS_DEFAULT_PROJID &&
 		    zfs_id_overblockquota(zfsvfs, DMU_PROJECTUSED_OBJECT,
 		    zp->z_projid))) {
-			if (abuf != NULL)
-				dmu_return_arcbuf(abuf);
 			error = SET_ERROR(EDQUOT);
 			break;
 		}
 
-		if (xuio && abuf == NULL) {
+		arc_buf_t *abuf = NULL;
+		const iovec_t *aiov = NULL;
+		if (xuio) {
 #ifdef HAVE_UIO_ZEROCOPY
 			ASSERT(i_iov < iovcnt);
 			ASSERT3U(uio->uio_segflg, !=, UIO_BVEC);
@@ -754,8 +746,7 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 			    aiov->iov_len == arc_buf_size(abuf)));
 			i_iov++;
 #endif
-		} else if (abuf == NULL && n >= max_blksz &&
-		    woff >= zp->z_size &&
+		} else if (n >= max_blksz && woff >= zp->z_size &&
 		    P2PHASE(woff, max_blksz) == 0 &&
 		    zp->z_blksz == max_blksz) {
 			/*
@@ -782,7 +773,7 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		/*
 		 * Start a transaction.
 		 */
-		tx = dmu_tx_create(zfsvfs->z_os);
+		dmu_tx_t *tx = dmu_tx_create(zfsvfs->z_os);
 		dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 		dmu_tx_hold_write(tx, zp->z_id, woff, MIN(n, max_blksz));
 		zfs_sa_upgrade_txholds(tx, zp);
@@ -795,12 +786,12 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		}
 
 		/*
-		 * If zfs_range_lock() over-locked we grow the blocksize
+		 * If rangelock_enter() over-locked we grow the blocksize
 		 * and then reduce the lock range.  This will only happen
-		 * on the first iteration since zfs_range_reduce() will
-		 * shrink down r_len to the appropriate size.
+		 * on the first iteration since rangelock_reduce() will
+		 * shrink down lr_length to the appropriate size.
 		 */
-		if (rl->r_len == UINT64_MAX) {
+		if (lr->lr_length == UINT64_MAX) {
 			uint64_t new_blksz;
 
 			if (zp->z_blksz > max_blksz) {
@@ -816,19 +807,32 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 				new_blksz = MIN(end_size, max_blksz);
 			}
 			zfs_grow_blocksize(zp, new_blksz, tx);
-			zfs_range_reduce(rl, woff, n);
+			rangelock_reduce(lr, woff, n);
 		}
 
 		/*
 		 * XXX - should we really limit each write to z_max_blksz?
 		 * Perhaps we should use SPA_MAXBLOCKSIZE chunks?
 		 */
-		nbytes = MIN(n, max_blksz - P2PHASE(woff, max_blksz));
+		ssize_t nbytes = MIN(n, max_blksz - P2PHASE(woff, max_blksz));
 
+		ssize_t tx_bytes;
 		if (abuf == NULL) {
 			tx_bytes = uio->uio_resid;
+			uio->uio_fault_disable = B_TRUE;
 			error = dmu_write_uio_dbuf(sa_get_db(zp->z_sa_hdl),
 			    uio, nbytes, tx);
+			uio->uio_fault_disable = B_FALSE;
+			if (error == EFAULT) {
+				dmu_tx_commit(tx);
+				if (uio_prefaultpages(MIN(n, max_blksz), uio)) {
+					break;
+				}
+				continue;
+			} else if (error != 0) {
+				dmu_tx_commit(tx);
+				break;
+			}
 			tx_bytes -= uio->uio_resid;
 		} else {
 			tx_bytes = nbytes;
@@ -849,8 +853,13 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 				xuio_stat_wbuf_copied();
 			} else {
 				ASSERT(xuio || tx_bytes == max_blksz);
-				dmu_assign_arcbuf_by_dbuf(
+				error = dmu_assign_arcbuf_by_dbuf(
 				    sa_get_db(zp->z_sa_hdl), woff, abuf, tx);
+				if (error != 0) {
+					dmu_return_arcbuf(abuf);
+					dmu_tx_commit(tx);
+					break;
+				}
 			}
 			ASSERT(tx_bytes <= uio->uio_resid);
 			uioskip(uio, tx_bytes);
@@ -884,7 +893,7 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		 * user 0 is not an ephemeral uid.
 		 */
 		mutex_enter(&zp->z_acl_lock);
-		uid = KUID_TO_SUID(ip->i_uid);
+		uint32_t uid = KUID_TO_SUID(ip->i_uid);
 		if ((zp->z_mode & (S_IXUSR | (S_IXUSR >> 3) |
 		    (S_IXUSR >> 6))) != 0 &&
 		    (zp->z_mode & (S_ISUID | S_ISGID)) != 0 &&
@@ -928,12 +937,16 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 		ASSERT(tx_bytes == nbytes);
 		n -= nbytes;
 
-		if (!xuio && n > 0)
-			uio_prefaultpages(MIN(n, max_blksz), uio);
+		if (!xuio && n > 0) {
+			if (uio_prefaultpages(MIN(n, max_blksz), uio)) {
+				error = EFAULT;
+				break;
+			}
+		}
 	}
 
 	zfs_inode_update(zp);
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	/*
 	 * If we're in replay mode, or we made no progress, return error.
@@ -947,6 +960,10 @@ zfs_write(struct inode *ip, uio_t *uio, int ioflag, cred_t *cr)
 	if (ioflag & (FSYNC | FDSYNC) ||
 	    zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
 		zil_commit(zilog, zp->z_id);
+
+	int64_t nwritten = start_resid - uio->uio_resid;
+	dataset_kstats_update_write_kstats(&zfsvfs->z_kstat, nwritten);
+	task_io_account_write(nwritten);
 
 	ZFS_EXIT(zfsvfs);
 	return (0);
@@ -973,6 +990,7 @@ zfs_iput_async(struct inode *ip)
 		iput(ip);
 }
 
+/* ARGSUSED */
 void
 zfs_get_done(zgd_t *zgd, int error)
 {
@@ -981,16 +999,13 @@ zfs_get_done(zgd_t *zgd, int error)
 	if (zgd->zgd_db)
 		dmu_buf_rele(zgd->zgd_db, zgd);
 
-	zfs_range_unlock(zgd->zgd_rl);
+	rangelock_exit(zgd->zgd_lr);
 
 	/*
 	 * Release the vnode asynchronously as we currently have the
 	 * txg stopped from syncing.
 	 */
 	zfs_iput_async(ZTOI(zp));
-
-	if (error == 0 && zgd->zgd_bp)
-		zil_lwb_add_block(zgd->zgd_lwb, zgd->zgd_bp);
 
 	kmem_free(zgd, sizeof (zgd_t));
 }
@@ -1045,8 +1060,8 @@ zfs_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb, zio_t *zio)
 	 * we don't have to write the data twice.
 	 */
 	if (buf != NULL) { /* immediate write */
-		zgd->zgd_rl = zfs_range_lock(&zp->z_range_lock, offset, size,
-		    RL_READER);
+		zgd->zgd_lr = rangelock_enter(&zp->z_rangelock,
+		    offset, size, RL_READER);
 		/* test for truncation needs to be done while range locked */
 		if (offset >= zp->z_size) {
 			error = SET_ERROR(ENOENT);
@@ -1067,12 +1082,12 @@ zfs_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb, zio_t *zio)
 			size = zp->z_blksz;
 			blkoff = ISP2(size) ? P2PHASE(offset, size) : offset;
 			offset -= blkoff;
-			zgd->zgd_rl = zfs_range_lock(&zp->z_range_lock, offset,
-			    size, RL_READER);
+			zgd->zgd_lr = rangelock_enter(&zp->z_rangelock,
+			    offset, size, RL_READER);
 			if (zp->z_blksz == size)
 				break;
 			offset += blkoff;
-			zfs_range_unlock(zgd->zgd_rl);
+			rangelock_exit(zgd->zgd_lr);
 		}
 		/* test for truncation needs to be done while range locked */
 		if (lr->lr_offset >= zp->z_size)
@@ -1115,11 +1130,7 @@ zfs_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb, zio_t *zio)
 				 * TX_WRITE2 relies on the data previously
 				 * written by the TX_WRITE that caused
 				 * EALREADY.  We zero out the BP because
-				 * it is the old, currently-on-disk BP,
-				 * so there's no need to zio_flush() its
-				 * vdevs (flushing would needlesly hurt
-				 * performance, and doesn't work on
-				 * indirect vdevs).
+				 * it is the old, currently-on-disk BP.
 				 */
 				zgd->zgd_bp = NULL;
 				BP_ZERO(bp);
@@ -1205,27 +1216,6 @@ zfs_lookup(struct inode *dip, char *nm, struct inode **ipp, int flags,
 				return (0);
 			}
 			return (error);
-#ifdef HAVE_DNLC
-		} else if (!zdp->z_zfsvfs->z_norm &&
-		    (zdp->z_zfsvfs->z_case == ZFS_CASE_SENSITIVE)) {
-
-			vnode_t *tvp = dnlc_lookup(dvp, nm);
-
-			if (tvp) {
-				error = zfs_fastaccesschk_execute(zdp, cr);
-				if (error) {
-					iput(tvp);
-					return (error);
-				}
-				if (tvp == DNLC_NO_VNODE) {
-					iput(tvp);
-					return (SET_ERROR(ENOENT));
-				} else {
-					*vpp = tvp;
-					return (specvp_check(vpp, cr));
-				}
-			}
-#endif /* HAVE_DNLC */
 		}
 	}
 
@@ -1302,7 +1292,7 @@ zfs_lookup(struct inode *dip, char *nm, struct inode **ipp, int flags,
  *		excl	- flag indicating exclusive or non-exclusive mode.
  *		mode	- mode to open file with.
  *		cr	- credentials of caller.
- *		flag	- large file flag [UNUSED].
+ *		flag	- file flag.
  *		vsecp	- ACL to be set
  *
  *	OUT:	ipp	- inode of created or trunc'd entry.
@@ -1686,6 +1676,7 @@ out:
  *	IN:	dip	- inode of directory to remove entry from.
  *		name	- name of entry to remove.
  *		cr	- credentials of caller.
+ *		flags	- case flags.
  *
  *	RETURN:	0 if success
  *		error code if failure
@@ -1761,13 +1752,6 @@ top:
 		error = SET_ERROR(EPERM);
 		goto out;
 	}
-
-#ifdef HAVE_DNLC
-	if (realnmp)
-		dnlc_remove(dvp, realnmp->pn_buf);
-	else
-		dnlc_remove(dvp, name);
-#endif /* HAVE_DNLC */
 
 	mutex_enter(&zp->z_lock);
 	may_delete_now = atomic_read(&ip->i_count) == 1 && !(zp->z_is_mapped);
@@ -1934,6 +1918,7 @@ out:
  *		dirname	- name of new directory.
  *		vap	- attributes of new directory.
  *		cr	- credentials of caller.
+ *		flags	- case flags.
  *		vsecp	- ACL to be set
  *
  *	OUT:	ipp	- inode of created directory.
@@ -2252,13 +2237,12 @@ out:
 }
 
 /*
- * Read as many directory entries as will fit into the provided
- * dirent buffer from the given directory cursor position.
+ * Read directory entries from the given directory cursor position and emit
+ * name and position for each entry.
  *
  *	IN:	ip	- inode of directory to read.
- *		dirent	- buffer for directory entries.
- *
- *	OUT:	dirent	- filler buffer of directory entries.
+ *		ctx	- directory entry context.
+ *		cr	- credentials of caller.
  *
  *	RETURN:	0 if success
  *		error code if failure
@@ -2674,6 +2658,12 @@ zfs_getattr_fast(struct inode *ip, struct kstat *sp)
 	mutex_enter(&zp->z_lock);
 
 	generic_fillattr(ip, sp);
+	/*
+	 * +1 link count for root inode with visible '.zfs' directory.
+	 */
+	if ((zp->z_id == zfsvfs->z_root) && zfs_show_ctldir(zp))
+		if (sp->nlink < ZFS_LINK_MAX)
+			sp->nlink++;
 
 	sa_object_size(zp->z_sa_hdl, &blksize, &nblocks);
 	sp->blksize = blksize;
@@ -2728,11 +2718,12 @@ zfs_setattr_dir(znode_t *dzp)
 	dmu_tx_t	*tx = NULL;
 	uint64_t	uid, gid;
 	sa_bulk_attr_t	bulk[4];
-	int		count = 0;
+	int		count;
 	int		err;
 
 	zap_cursor_init(&zc, os, dzp->z_id);
 	while ((err = zap_cursor_retrieve(&zc, &zap)) == 0) {
+		count = 0;
 		if (zap.za_integer_length != 8 || zap.za_num_integers != 1) {
 			err = ENXIO;
 			break;
@@ -3419,7 +3410,7 @@ top:
 
 	if (mask & (ATTR_MTIME | ATTR_SIZE)) {
 		ZFS_TIME_ENCODE(&vap->va_mtime, mtime);
-		ZTOI(zp)->i_mtime = timespec_trunc(vap->va_mtime,
+		ZTOI(zp)->i_mtime = zpl_inode_timespec_trunc(vap->va_mtime,
 		    ZTOI(zp)->i_sb->s_time_gran);
 
 		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL,
@@ -3428,7 +3419,7 @@ top:
 
 	if (mask & (ATTR_CTIME | ATTR_SIZE)) {
 		ZFS_TIME_ENCODE(&vap->va_ctime, ctime);
-		ZTOI(zp)->i_ctime = timespec_trunc(vap->va_ctime,
+		ZTOI(zp)->i_ctime = zpl_inode_timespec_trunc(vap->va_ctime,
 		    ZTOI(zp)->i_sb->s_time_gran);
 		SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL,
 		    ctime, sizeof (ctime));
@@ -4016,12 +4007,13 @@ out:
  * Insert the indicated symbolic reference entry into the directory.
  *
  *	IN:	dip	- Directory to contain new symbolic link.
- *		link	- Name for new symlink entry.
+ *		name	- Name of directory entry in dip.
  *		vap	- Attributes of new entry.
- *		target	- Target path of new symlink.
- *
+ *		link	- Name for new symlink entry.
  *		cr	- credentials of caller.
  *		flags	- case flags
+ *
+ *	OUT:	ipp	- Inode for new symbolic link.
  *
  *	RETURN:	0 on success, error code on failure.
  *
@@ -4226,6 +4218,7 @@ zfs_readlink(struct inode *ip, uio_t *uio, cred_t *cr)
  *		sip	- inode of new entry.
  *		name	- name of new entry.
  *		cr	- credentials of caller.
+ *		flags	- case flags.
  *
  *	RETURN:	0 if success
  *		error code if failure
@@ -4446,7 +4439,6 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 	loff_t		offset;
 	loff_t		pgoff;
 	unsigned int	pglen;
-	rl_t		*rl;
 	dmu_tx_t	*tx;
 	caddr_t		va;
 	int		err = 0;
@@ -4520,13 +4512,14 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 	redirty_page_for_writepage(wbc, pp);
 	unlock_page(pp);
 
-	rl = zfs_range_lock(&zp->z_range_lock, pgoff, pglen, RL_WRITER);
+	locked_range_t *lr = rangelock_enter(&zp->z_rangelock,
+	    pgoff, pglen, RL_WRITER);
 	lock_page(pp);
 
 	/* Page mapping changed or it was no longer dirty, we're done */
 	if (unlikely((mapping != pp->mapping) || !PageDirty(pp))) {
 		unlock_page(pp);
-		zfs_range_unlock(rl);
+		rangelock_exit(lr);
 		ZFS_EXIT(zfsvfs);
 		return (0);
 	}
@@ -4534,10 +4527,12 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 	/* Another process started write block if required */
 	if (PageWriteback(pp)) {
 		unlock_page(pp);
-		zfs_range_unlock(rl);
+		rangelock_exit(lr);
 
-		if (wbc->sync_mode != WB_SYNC_NONE)
-			wait_on_page_writeback(pp);
+		if (wbc->sync_mode != WB_SYNC_NONE) {
+			if (PageWriteback(pp))
+				wait_on_page_bit(pp, PG_writeback);
+		}
 
 		ZFS_EXIT(zfsvfs);
 		return (0);
@@ -4546,7 +4541,7 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 	/* Clear the dirty flag the required locks are held */
 	if (!clear_page_dirty_for_io(pp)) {
 		unlock_page(pp);
-		zfs_range_unlock(rl);
+		rangelock_exit(lr);
 		ZFS_EXIT(zfsvfs);
 		return (0);
 	}
@@ -4573,7 +4568,7 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 		__set_page_dirty_nobuffers(pp);
 		ClearPageError(pp);
 		end_page_writeback(pp);
-		zfs_range_unlock(rl);
+		rangelock_exit(lr);
 		ZFS_EXIT(zfsvfs);
 		return (err);
 	}
@@ -4600,7 +4595,7 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 	    zfs_putpage_commit_cb, pp);
 	dmu_tx_commit(tx);
 
-	zfs_range_unlock(rl);
+	rangelock_exit(lr);
 
 	if (wbc->sync_mode != WB_SYNC_NONE) {
 		/*
@@ -4737,7 +4732,6 @@ zfs_inactive(struct inode *ip)
  *	IN:	ip	- inode seeking within
  *		ooff	- old file offset
  *		noffp	- pointer to new file offset
- *		ct	- caller context
  *
  *	RETURN:	0 if success
  *		EINVAL if new offset invalid
@@ -4884,19 +4878,19 @@ convoff(struct inode *ip, flock64_t *lckdat, int  whence, offset_t offset)
 	vattr_t vap;
 	int error;
 
-	if ((lckdat->l_whence == 2) || (whence == 2)) {
+	if ((lckdat->l_whence == SEEK_END) || (whence == SEEK_END)) {
 		if ((error = zfs_getattr(ip, &vap, 0, CRED())))
 			return (error);
 	}
 
 	switch (lckdat->l_whence) {
-	case 1:
+	case SEEK_CUR:
 		lckdat->l_start += offset;
 		break;
-	case 2:
+	case SEEK_END:
 		lckdat->l_start += vap.va_size;
 		/* FALLTHRU */
-	case 0:
+	case SEEK_SET:
 		break;
 	default:
 		return (SET_ERROR(EINVAL));
@@ -4906,13 +4900,13 @@ convoff(struct inode *ip, flock64_t *lckdat, int  whence, offset_t offset)
 		return (SET_ERROR(EINVAL));
 
 	switch (whence) {
-	case 1:
+	case SEEK_CUR:
 		lckdat->l_start -= offset;
 		break;
-	case 2:
+	case SEEK_END:
 		lckdat->l_start -= vap.va_size;
 		/* FALLTHRU */
-	case 0:
+	case SEEK_SET:
 		break;
 	default:
 		return (SET_ERROR(EINVAL));
@@ -4933,7 +4927,7 @@ convoff(struct inode *ip, flock64_t *lckdat, int  whence, offset_t offset)
  *		bfp	- section of file to free/alloc.
  *		flag	- current file open mode flags.
  *		offset	- current file offset.
- *		cr	- credentials of caller [UNUSED].
+ *		cr	- credentials of caller.
  *
  *	RETURN:	0 on success, error code on failure.
  *
@@ -4967,7 +4961,7 @@ zfs_space(struct inode *ip, int cmd, flock64_t *bfp, int flag,
 		return (SET_ERROR(EROFS));
 	}
 
-	if ((error = convoff(ip, bfp, 0, offset))) {
+	if ((error = convoff(ip, bfp, SEEK_SET, offset))) {
 		ZFS_EXIT(zfsvfs);
 		return (error);
 	}
@@ -5234,7 +5228,7 @@ zfs_retzcbuf(struct inode *ip, xuio_t *xuio, cred_t *cr)
 }
 #endif /* HAVE_UIO_ZEROCOPY */
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(zfs_open);
 EXPORT_SYMBOL(zfs_close);
 EXPORT_SYMBOL(zfs_read);

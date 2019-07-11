@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  */
@@ -84,6 +84,13 @@ typedef enum dbuf_states {
 	DB_EVICTING
 } dbuf_states_t;
 
+typedef enum dbuf_cached_state {
+	DB_NO_CACHE = -1,
+	DB_DBUF_CACHE,
+	DB_DBUF_METADATA_CACHE,
+	DB_CACHE_MAX
+} dbuf_cached_state_t;
+
 struct dnode;
 struct dmu_tx;
 
@@ -100,6 +107,12 @@ typedef enum override_states {
 	DR_IN_DMU_SYNC,
 	DR_OVERRIDDEN
 } override_states_t;
+
+typedef enum db_lock_type {
+	DLT_NONE,
+	DLT_PARENT,
+	DLT_OBJSET
+} db_lock_type_t;
 
 typedef struct dbuf_dirty_record {
 	/* link on our parents dirty list */
@@ -210,6 +223,22 @@ typedef struct dmu_buf_impl {
 	 */
 	uint8_t db_level;
 
+	/*
+	 * Protects db_buf's contents if they contain an indirect block or data
+	 * block of the meta-dnode. We use this lock to protect the structure of
+	 * the block tree. This means that when modifying this dbuf's data, we
+	 * grab its rwlock. When modifying its parent's data (including the
+	 * blkptr to this dbuf), we grab the parent's rwlock. The lock ordering
+	 * for this lock is:
+	 * 1) dn_struct_rwlock
+	 * 2) db_rwlock
+	 * We don't currently grab multiple dbufs' db_rwlocks at once.
+	 */
+	krwlock_t db_rwlock;
+
+	/* buffer holding our data */
+	arc_buf_t *db_buf;
+
 	/* db_mtx protects the members below */
 	kmutex_t db_mtx;
 
@@ -223,10 +252,7 @@ typedef struct dmu_buf_impl {
 	 * If nonzero, the buffer can't be destroyed.
 	 * Protected by db_mtx.
 	 */
-	refcount_t db_holds;
-
-	/* buffer holding our data */
-	arc_buf_t *db_buf;
+	zfs_refcount_t db_holds;
 
 	kcondvar_t db_changed;
 	dbuf_dirty_record_t *db_data_pending;
@@ -240,10 +266,11 @@ typedef struct dmu_buf_impl {
 	 */
 	avl_node_t db_link;
 
-	/*
-	 * Link in dbuf_cache.
-	 */
+	/* Link in dbuf_cache or dbuf_metadata_cache */
 	multilist_node_t db_cache_link;
+
+	/* Tells us which dbuf cache this dbuf is in, if any */
+	dbuf_cached_state_t db_caching_status;
 
 	/* Data which is unique to data (leaf) blocks: */
 
@@ -305,7 +332,7 @@ boolean_t dbuf_try_add_ref(dmu_buf_t *db, objset_t *os, uint64_t obj,
 uint64_t dbuf_refcount(dmu_buf_impl_t *db);
 
 void dbuf_rele(dmu_buf_impl_t *db, void *tag);
-void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag);
+void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting);
 
 dmu_buf_impl_t *dbuf_find(struct objset *os, uint64_t object, uint8_t level,
     uint64_t blkid);
@@ -321,13 +348,14 @@ void dmu_buf_write_embedded(dmu_buf_t *dbuf, void *data,
     bp_embedded_type_t etype, enum zio_compress comp,
     int uncompressed_size, int compressed_size, int byteorder, dmu_tx_t *tx);
 
+void dmu_buf_redact(dmu_buf_t *dbuf, dmu_tx_t *tx);
 void dbuf_destroy(dmu_buf_impl_t *db);
 
 void dbuf_unoverride(dbuf_dirty_record_t *dr);
 void dbuf_sync_list(list_t *list, int level, dmu_tx_t *tx);
 void dbuf_release_bp(dmu_buf_impl_t *db);
-
-boolean_t dbuf_can_remap(const dmu_buf_impl_t *buf);
+db_lock_type_t dmu_buf_lock_parent(dmu_buf_impl_t *db, krw_t rw, void *tag);
+void dmu_buf_unlock_parent(dmu_buf_impl_t *db, db_lock_type_t type, void *tag);
 
 void dbuf_free_range(struct dnode *dn, uint64_t start, uint64_t end,
     struct dmu_tx *);
@@ -336,6 +364,9 @@ void dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx);
 
 void dbuf_stats_init(dbuf_hash_table_t *hash);
 void dbuf_stats_destroy(void);
+
+int dbuf_dnode_findbp(dnode_t *dn, uint64_t level, uint64_t blkid,
+    blkptr_t *bp, uint16_t *datablkszsec, uint8_t *indblkshift);
 
 #define	DB_DNODE(_db)		((_db)->db_dnode_handle->dnh_dnode)
 #define	DB_DNODE_LOCK(_db)	((_db)->db_dnode_handle->dnh_zrlock)

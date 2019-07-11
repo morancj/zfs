@@ -23,7 +23,7 @@
  * Use is subject to license terms.
  */
 /*
- * Copyright (c) 2013, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2013, 2017 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
@@ -118,7 +118,7 @@ range_tree_stat_verify(range_tree_t *rt)
 
 	for (i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
 		if (hist[i] != rt->rt_histogram[i]) {
-			zfs_dbgmsg("i=%d, hist=%p, hist=%llu, rt_hist=%llu",
+			zfs_dbgmsg("i=%d, hist=%px, hist=%llu, rt_hist=%llu",
 			    i, hist, hist[i], rt->rt_histogram[i]);
 		}
 		VERIFY3U(hist[i], ==, rt->rt_histogram[i]);
@@ -491,7 +491,6 @@ range_tree_resize_segment(range_tree_t *rt, range_seg_t *rs,
 static range_seg_t *
 range_tree_find_impl(range_tree_t *rt, uint64_t start, uint64_t size)
 {
-	avl_index_t where;
 	range_seg_t rsearch;
 	uint64_t end = start + size;
 
@@ -499,7 +498,7 @@ range_tree_find_impl(range_tree_t *rt, uint64_t start, uint64_t size)
 
 	rsearch.rs_start = start;
 	rsearch.rs_end = end;
-	return (avl_find(&rt->rt_root, &rsearch, &where));
+	return (avl_find(&rt->rt_root, &rsearch, NULL));
 }
 
 range_seg_t *
@@ -512,13 +511,11 @@ range_tree_find(range_tree_t *rt, uint64_t start, uint64_t size)
 }
 
 void
-range_tree_verify(range_tree_t *rt, uint64_t off, uint64_t size)
+range_tree_verify_not_present(range_tree_t *rt, uint64_t off, uint64_t size)
 {
-	range_seg_t *rs;
-
-	rs = range_tree_find(rt, off, size);
+	range_seg_t *rs = range_tree_find(rt, off, size);
 	if (rs != NULL)
-		panic("freeing free block; rs=%p", (void *)rs);
+		panic("segment already in tree; rs=%p", (void *)rs);
 }
 
 boolean_t
@@ -599,6 +596,13 @@ range_tree_space(range_tree_t *rt)
 	return (rt->rt_space);
 }
 
+boolean_t
+range_tree_is_empty(range_tree_t *rt)
+{
+	ASSERT(rt != NULL);
+	return (range_tree_space(rt) == 0);
+}
+
 /* Generic range tree functions for maintaining segments in an AVL tree. */
 void
 rt_avl_create(range_tree_t *rt, void *arg)
@@ -642,4 +646,24 @@ rt_avl_vacate(range_tree_t *rt, void *arg)
 	 * will be freed by the range tree, so we don't want to free them here.
 	 */
 	rt_avl_create(rt, arg);
+}
+
+uint64_t
+range_tree_min(range_tree_t *rt)
+{
+	range_seg_t *rs = avl_first(&rt->rt_root);
+	return (rs != NULL ? rs->rs_start : 0);
+}
+
+uint64_t
+range_tree_max(range_tree_t *rt)
+{
+	range_seg_t *rs = avl_last(&rt->rt_root);
+	return (rs != NULL ? rs->rs_end : 0);
+}
+
+uint64_t
+range_tree_span(range_tree_t *rt)
+{
+	return (range_tree_max(rt) - range_tree_min(rt));
 }

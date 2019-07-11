@@ -20,11 +20,13 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2018 by Delphix. All rights reserved.
  */
 
 #ifndef	_SYS_FS_ZFS_VFSOPS_H
 #define	_SYS_FS_ZFS_VFSOPS_H
 
+#include <sys/dataset_kstats.h>
 #include <sys/isa_defs.h>
 #include <sys/types32.h>
 #include <sys/list.h>
@@ -32,7 +34,9 @@
 #include <sys/zil.h>
 #include <sys/sa.h>
 #include <sys/rrwlock.h>
+#include <sys/dsl_dataset.h>
 #include <sys/zfs_ioctl.h>
+#include <sys/objlist.h>
 
 #ifdef	__cplusplus
 extern "C" {
@@ -95,7 +99,6 @@ struct zfsvfs {
 	zfs_case_t	z_case;		/* case-sense */
 	boolean_t	z_utf8;		/* utf8-only */
 	int		z_norm;		/* normalization flags */
-	boolean_t	z_atime;	/* enable atimes mount option */
 	boolean_t	z_relatime;	/* enable relatime mount option */
 	boolean_t	z_unmounted;	/* unmounted */
 	rrmlock_t	z_teardown_lock;
@@ -114,8 +117,11 @@ struct zfsvfs {
 	boolean_t	z_replay;	/* set during ZIL replay */
 	boolean_t	z_use_sa;	/* version allow system attributes */
 	boolean_t	z_xattr_sa;	/* allow xattrs to be stores as SA */
+	boolean_t	z_draining;	/* is true when drain is active */
+	boolean_t	z_drain_cancel; /* signal the unlinked drain to stop */
 	uint64_t	z_version;	/* ZPL version */
 	uint64_t	z_shares_dir;	/* hidden shares dir */
+	dataset_kstats_t	z_kstat;	/* fs kstats */
 	kmutex_t	z_lock;
 	uint64_t	z_userquota_obj;
 	uint64_t	z_groupquota_obj;
@@ -128,6 +134,7 @@ struct zfsvfs {
 	uint64_t	z_hold_size;	/* znode hold array size */
 	avl_tree_t	*z_hold_trees;	/* znode hold trees */
 	kmutex_t	*z_hold_locks;	/* znode hold locks */
+	taskqid_t	z_drain_task;	/* task id for the unlink drain task */
 };
 
 #define	ZSB_XATTR	0x0001		/* Enable user xattrs */
@@ -191,6 +198,7 @@ extern uint_t zfs_fsyncer_key;
 
 extern int zfs_suspend_fs(zfsvfs_t *zfsvfs);
 extern int zfs_resume_fs(zfsvfs_t *zfsvfs, struct dsl_dataset *ds);
+extern int zfs_end_fs(zfsvfs_t *zfsvfs, struct dsl_dataset *ds);
 extern int zfs_userspace_one(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
     const char *domain, uint64_t rid, uint64_t *valuep);
 extern int zfs_userspace_many(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
@@ -208,6 +216,7 @@ extern int zfsvfs_create(const char *name, boolean_t readony, zfsvfs_t **zfvp);
 extern int zfsvfs_create_impl(zfsvfs_t **zfvp, zfsvfs_t *zfsvfs, objset_t *os);
 extern void zfsvfs_free(zfsvfs_t *zfsvfs);
 extern int zfs_check_global_label(const char *dsname, const char *hexsl);
+extern objlist_t *zfs_get_deleteq(objset_t *os);
 
 extern boolean_t zfs_is_readonly(zfsvfs_t *zfsvfs);
 extern int zfs_domount(struct super_block *sb, zfs_mnt_t *zm, int silent);
